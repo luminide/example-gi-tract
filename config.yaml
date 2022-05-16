@@ -1,0 +1,31 @@
+# for a complete list of available architectures, see
+# https://github.com/facebookresearch/detectron2/tree/main/configs/COCO-InstanceSegmentation
+arch: 'COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml'
+pretrained: True
+
+# optimizer settings
+lr: 0.01
+momentum: 0.9
+nesterov: False
+
+# scheduler settings
+gamma: 0.1
+# set this to -1 to disable learning rate decay
+decay_steps: -1
+min_size: 266
+max_size: 400
+# augmentation probability
+aug_prob: 0.1
+# rotation angle in degrees
+angle: 5
+
+# detectron2
+ims_per_batch: 16
+crop_size: 0.9
+fpn_channels: 256
+prop_gen: 'RPN'
+nms_thresh: 0.75
+bsz_per_img: 512
+loss_type: 'smooth_l1'
+reg_loss_weight: 1.0
+score_thresh_test: 0.05
