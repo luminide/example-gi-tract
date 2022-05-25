@@ -1,30 +1,58 @@
-import argparse
-import glob
+import os
 import cv2
+from glob import glob
+import multiprocessing as mp
 import numpy as np
 import pandas as pd
 import torch
+from torch import nn
+import torch.utils.data as data
 
-import detectron2
-from detectron2.config import CfgNode as CN
-from detectron2.engine import DefaultPredictor
-from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.modeling import build_model
+from util import get_class_names, make_test_augmenter, get_id
+from dataset import VisionDataset
+from models import ModelWrapper
+from config import Config
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Running on {device}')
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    '--input', default='../input', metavar='DIR', help='input directory')
-parser.add_argument(
-    '--model_dir', default='.', type=str, metavar='PATH',
-    help='path to saved models')
+def create_test_loader(conf, input_dir, class_names):
+    test_aug = make_test_augmenter(conf)
+    test_df = pd.DataFrame()
+    img_files = []
+    img_dir = 'test'
+    subdir = ''
+    while len(img_files) == 0 and len(subdir) < 10:
+        img_files = sorted(glob(f'{input_dir}/{img_dir}/{subdir}*.png'))
+        subdir += '*/'
+        if len(subdir) > 10:
+            return None
+    # delete common prefix from paths
+    img_files = [f.replace(f'{input_dir}/{img_dir}/', '') for f in img_files]
 
+    test_df['img_files'] = img_files
+    test_dataset = VisionDataset(
+        test_df, conf, input_dir, img_dir,
+        class_names, test_aug, is_test=True)
+    print(f'{len(test_dataset)} examples in test set')
+    loader = data.DataLoader(
+        test_dataset, batch_size=conf.batch_size, shuffle=False,
+        num_workers=mp.cpu_count(), pin_memory=False)
+    return loader, test_df
+
+def create_model(model_dir, num_classes):
+    checkpoint = torch.load(f'{model_dir}/model.pth', map_location=device)
+    conf = Config(checkpoint['conf'])
+    conf.pretrained = False
+    model = ModelWrapper(conf, num_classes)
+    model = model.to(device)
+    model.load_state_dict(checkpoint['model'])
+    return model, conf
 
 def rle_encode(img):
     '''
     this function is adapted from
     https://www.kaggle.com/code/stainsby/fast-tested-rle/notebook
-
     img: numpy array, 1 - mask, 0 - background
     Returns run length as string formated
     '''
@@ -34,52 +62,72 @@ def rle_encode(img):
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
 
-def get_masks(pred):
-    instances = pred['instances']
-    pred_class = torch.mode(instances.pred_classes)[0].item() + 1
-    pred_masks = instances.pred_masks.cpu().numpy()
+def get_img_shape(filename):
+    basename = os.path.basename(filename)
+    tokens = basename.split('_')
+    height, width = int(tokens[3]), int(tokens[2])
+    return (height, width)
 
-    res = []
-    used = np.zeros(instances.image_size, dtype=int)
-    # filter out overlaps
-    for mask in pred_masks:
-        mask = mask*(1 - used)
-        if mask.sum() <= 0:
-            continue
-        used += mask
-        res.append(rle_encode(mask))
-    return res, pred_class
+def pad_mask(conf, mask):
+    # pad image to conf.image_size
+    padded = np.zeros((conf.image_size, conf.image_size), dtype=mask.dtype)
+    dh = conf.image_size - mask.shape[0]
+    dw = conf.image_size - mask.shape[1]
 
-def run(input_dir, model_dir):
-    meta_file = f'{input_dir}/train.csv'
-    meta_df = pd.read_csv(meta_file)
+    top = dh//2
+    left = dw//2
+    padded[top:top + mask.shape[0], left:left + mask.shape[1]] = mask
+    return padded
 
-    cfg = CN.load_cfg(open(f'{model_dir}/cfg.yaml'))
-    print('processing test set...')
-    model_file = f'{model_dir}/model.pth'
-    cfg.MODEL.WEIGHTS = model_file
-    print(f'loading {model_file}')
+def resize_mask(mask, height, width):
+    return cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
-    model = build_model(cfg)
-    DetectionCheckpointer(model).load(model_file)
+def run(input_dir, model_dir, thresh):
+    meta_file = os.path.join(input_dir, 'train.csv')
+    train_df = pd.read_csv(meta_file, dtype=str)
+    class_names = np.array(get_class_names(train_df))
+    num_classes = len(class_names)
 
-    predictor = DefaultPredictor(cfg)
-    test_names = sorted(glob.glob(f'{input_dir}/test/*.png'))
+    model, conf = create_model(model_dir, num_classes)
+    loader, df = create_test_loader(conf, input_dir, class_names)
+    img_files = df['img_files']
+
+    subm = pd.read_csv(f'{input_dir}/sample_submission.csv')
+    del subm['predicted']
+
     ids = []
+    classes = []
     masks = []
-    for img_file in test_names:
-        img_data = cv2.imread(img_file)
-        pred = predictor(img_data)
-        img_masks, pred_class = get_masks(pred)
-        img_id = img_file.split('/')[-1][:-4]
-        ids.extend([img_id]*len(img_masks))
-        masks.extend(img_masks)
+    img_idx = 0
+    sigmoid = nn.Sigmoid()
+    model.eval()
+    with torch.no_grad():
+        for images, _ in loader:
+            images = images.to(device)
+            outputs = model(images)
+            preds = sigmoid(outputs).cpu().numpy()
+            preds[preds >= thresh] = 1
+            preds[preds < thresh] = 0
+            for pred in preds:
+                img_file = img_files[img_idx]
+                img_idx += 1
+                img_id = get_id(img_file)
+                height, width = get_img_shape(img_file)
+                for class_id, class_name in enumerate(class_names):
+                    mask = pred[class_id]
+                    mask = pad_mask(conf, mask)
+                    mask = resize_mask(mask, height, width)
+                    enc_mask = '' if mask.sum() == 0 else rle_encode(mask)
+                    ids.append(img_id)
+                    classes.append(class_name)
+                    masks.append(enc_mask)
 
-    assert len(ids) == len(masks)
-    pd.DataFrame({'id': ids, 'predicted': masks}).to_csv('submission.csv', index=False)
-    print(pd.read_csv('submission.csv').head())
-
+    pred_df = pd.DataFrame({'id': ids, 'class': classes, 'predicted': masks})
+    if pred_df.shape[0] > 0:
+        # sort according to the given order and save to a csv file
+        subm = subm.merge(pred_df, on=['id', 'class'])
+    subm.to_csv('submission.csv', index=False)
 
 if __name__ == '__main__':
-    args = parser.parse_args()
-    run(args.input, args.model_dir)
+    test_thresh = 0.5
+    run('../input', './', test_thresh)

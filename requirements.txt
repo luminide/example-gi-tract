@@ -1,5 +1,1 @@
-pandas
-torchvision
-torch
-numpy
-detectron2
+segmentation_models_pytorch

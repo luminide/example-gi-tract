@@ -1,29 +1,25 @@
 import os
-import sys
 import argparse
 import random
 import multiprocessing as mp
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import segmentation_models_pytorch as smp
 
 import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
 import torch
+from torch import nn
+import torch.utils.data as data
+from torch import autocast
+from torch.cuda.amp import GradScaler
 
-from detectron2 import model_zoo
-from detectron2.data import build_detection_train_loader, DatasetMapper
-from detectron2.engine import DefaultTrainer
-from detectron2.engine import HookBase
-from detectron2.utils import comm
-from detectron2.engine import PeriodicWriter
-from detectron2.config import get_cfg
-from detectron2.config import CfgNode as CN
-from detectron2.data import DatasetCatalog
-from detectron2.data.datasets import register_coco_instances
-
-from evaluator import MAPIOUEvaluator
-from util import LossHistory, get_class_names
-from augment import build_train_augmentation
+from augment import make_train_augmenter
+from dataset import VisionDataset
+from models import ModelWrapper
 from config import Config
+import util
 
 
 parser = argparse.ArgumentParser()
@@ -34,176 +30,252 @@ parser.add_argument(
     '--epochs', default=40, type=int, metavar='N',
     help='number of total epochs to run')
 parser.add_argument(
-    '--seed', default=0, type=int,
+    '-p', '--print-interval', default=100, type=int, metavar='N',
+    help='print-interval in batches')
+parser.add_argument(
+    '--seed', default=None, type=int,
     help='seed for initializing the random number generator')
 parser.add_argument(
     '--resume', default='', type=str, metavar='PATH',
     help='path to saved model')
 parser.add_argument(
+    '-s', '--subset', default=100, type=int, metavar='N',
+    help='use a percentage of the data for training and validation')
+parser.add_argument(
     '--input', default='../input', metavar='DIR',
     help='input directory')
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device(device_type)
 
-
-# adapted from https://github.com/facebookresearch/detectron2/issues/810
-class ValidationLossHook(HookBase):
-
-    def __init__(self, cfg, conf, batch_count):
-        super().__init__()
-        self.cfg = cfg.clone()
+class Trainer:
+    def __init__(
+            self, conf, input_dir, device, num_workers,
+            checkpoint, print_interval=100, subset=100):
         self.conf = conf
-        self.cfg.DATASETS.TRAIN = cfg.DATASETS.TEST
-        self.batch_count = batch_count
-        self._loader = iter(build_detection_train_loader(self.cfg))
-        self.best_loss = None
-        self.epoch_losses = []
-        val_len = len(DatasetCatalog.get('val'))
-        val_batch_count = val_len//cfg.SOLVER.IMS_PER_BATCH
-        self.val_interval = batch_count//val_batch_count
-        assert self.val_interval > 0
+        self.input_dir = input_dir
+        self.device = device
+        self.max_patience = 10
+        self.print_interval = print_interval
+        self.use_amp = torch.cuda.is_available()
+        if self.use_amp:
+            self.scaler = GradScaler()
+
+        self.create_dataloaders(num_workers, subset)
+
+        self.model = ModelWrapper(conf, self.num_classes)
+        self.model = self.model.to(device)
+        self.optimizer = self.create_optimizer(conf, self.model)
+        assert  self.optimizer is not None, f'Unknown optimizer {conf.optim}'
+        if checkpoint:
+            self.model.load_state_dict(checkpoint['model'])
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer, gamma=conf.gamma)
+        self.loss_funcs = [
+            smp.losses.SoftBCEWithLogitsLoss(),
+            smp.losses.TverskyLoss(mode='multilabel', log_loss=False),
+        ]
+        self.history = None
+
+    def create_dataloaders(self, num_workers, subset):
+        conf = self.conf
+        meta_file = os.path.join(self.input_dir, 'train.csv')
+        assert os.path.exists(meta_file), f'{meta_file} not found on Compute Server'
+        meta_df = pd.read_csv(meta_file, dtype=str)
+        class_names = util.get_class_names(meta_df)
+        self.num_classes = len(class_names)
+
+        df = util.process_files(self.input_dir, 'train', meta_df, class_names)
+        # shuffle
+        df = df.sample(frac=1, random_state=0).reset_index(drop=True)
+        train_aug = make_train_augmenter(conf)
+        test_aug = util.make_test_augmenter(conf)
+
+        # split into train and validation sets
+        split = df.shape[0]*90//100
+        train_df = df.iloc[:split].reset_index(drop=True)
+        val_df = df.iloc[split:].reset_index(drop=True)
+        train_dataset = VisionDataset(
+            train_df, conf, self.input_dir, 'train',
+            class_names, train_aug, subset=subset)
+        val_dataset = VisionDataset(
+            val_df, conf, self.input_dir, 'train',
+            class_names, test_aug, subset=subset)
+        drop_last = (len(train_dataset) % conf.batch_size) == 1
+        self.train_loader = data.DataLoader(
+            train_dataset, batch_size=conf.batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=False,
+            worker_init_fn=worker_init_fn, drop_last=drop_last)
+        self.val_loader = data.DataLoader(
+            val_dataset, batch_size=conf.batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=False)
+
+    def create_optimizer(self, conf, model):
+        if conf.optim == 'sgd':
+            return torch.optim.SGD(
+                model.parameters(), lr=conf.lr, momentum=0.9,
+                weight_decay=conf.weight_decay)
+        if conf.optim == 'adam':
+            return torch.optim.AdamW(
+                model.parameters(), lr=conf.lr,
+                weight_decay=conf.weight_decay)
+        return None
+
+    def fit(self, epochs):
+        best_loss = None
+        patience = self.max_patience
         self.sample_count = 0
+        self.history = util.LossHistory()
 
-    def after_step(self):
-        curr_iter = self.trainer.iter
-        self.sample_count += self.cfg.SOLVER.IMS_PER_BATCH*self.cfg.DATALOADER.NUM_WORKERS
-        epoch = curr_iter//self.batch_count
-        # only consider mask loss
-        training_loss = self.trainer.storage.latest()['loss_mask'][0]
-        self.trainer.loss_history.add_train_loss(epoch, self.sample_count, training_loss)
-        # validate once every val_interval minibatches
-        if curr_iter % self.val_interval == 0:
-            data = next(self._loader)
-            with torch.no_grad():
-                loss_dict = self.trainer.model(data)
+        print(f'Running on {device}')
+        print(f'{len(self.train_loader.dataset)} examples in training set')
+        print(f'{len(self.val_loader.dataset)} examples in validation set')
+        trial = os.environ.get('TRIAL')
+        suffix = f"-trial{trial}" if trial is not None else ""
+        log_dir = f"runs/{datetime.now().strftime('%b%d_%H-%M-%S')}{suffix}"
+        writer = SummaryWriter(log_dir=log_dir)
 
-            losses = sum(loss_dict.values())
-            assert torch.isfinite(losses).all(), loss_dict
+        print('Training in progress...')
+        for epoch in range(epochs):
+            # train for one epoch
+            print(f'Epoch {epoch}:')
+            train_loss = self.train_epoch(epoch)
+            val_loss, val_score = self.validate()
+            self.scheduler.step()
+            writer.add_scalar('Training loss', train_loss, epoch)
+            writer.add_scalar('Validation loss', val_loss, epoch)
+            writer.add_scalar('Validation F1 score', val_score, epoch)
+            writer.flush()
+            print(f'training loss {train_loss:.5f}')
+            print(f'Validation F1 score {val_score:.4f} loss {val_loss:.4f}\n')
+            self.history.add_epoch_val_loss(epoch, self.sample_count, val_loss)
+            if best_loss is None or val_loss < best_loss:
+                best_loss = val_loss
+                state = {
+                    'epoch': epoch, 'model': self.model.state_dict(),
+                    'optimizer' : self.optimizer.state_dict(),
+                    'conf': self.conf.as_dict()
+                }
+                torch.save(state, 'model.pth')
+                patience = self.max_patience
+            else:
+                patience -= 1
+                if patience == 0:
+                    print(
+                        f'Validation loss did not improve for '
+                        f'{self.max_patience} epochs')
+                    break
 
-            loss_dict_reduced = {"val_" + k: v.item() for k, v in comm.reduce_dict(loss_dict).items()}
-            # only consider mask loss
-            val_loss = loss_dict_reduced['val_loss_mask']
-            self.trainer.loss_history.add_val_loss(epoch, self.sample_count, val_loss)
-            self.epoch_losses.append(val_loss)
-            if comm.is_main_process():
-                self.trainer.storage.put_scalars(
-                    val_total_loss=val_loss, **loss_dict_reduced)
+            self.history.save()
+        writer.close()
 
-        if (curr_iter + 1) % self.batch_count == 0:
-            # finished an epoch
-            curr_loss = np.mean(self.epoch_losses)
-            self.trainer.loss_history.add_epoch_val_loss(epoch, self.sample_count, curr_loss)
-            self.trainer.loss_history.save()
-            print(f'epoch {epoch} iter {curr_iter} curr loss {curr_loss:.4f}')
-            is_best = self.best_loss is None or curr_loss < self.best_loss
-            if is_best:
-                self.best_loss = curr_loss
-                additional_state = {'iteration': curr_iter, 'val_loss': curr_loss, 'conf': self.conf.as_dict()}
-                self.trainer.checkpointer.save('model', **additional_state)
-                print(f'Saved model at iter {curr_iter}. val_loss {curr_loss:.4f}')
-            self.epoch_losses = []
+    def criterion(self, outputs, labels):
+        result = 0
+        for func in self.loss_funcs:
+            result += func(outputs, labels)
+        return result
+
+    def train_epoch(self, epoch):
+        model = self.model
+        optimizer = self.optimizer
+
+        val_iter = iter(self.val_loader)
+        val_interval = len(self.train_loader)//len(self.val_loader)
+        assert val_interval > 0
+        train_loss_list = []
+        model.train()
+        for step, (images, labels) in enumerate(self.train_loader):
+            if (step + 1) % val_interval == 0:
+                model.eval()
+                # collect validation history for tuning
+                try:
+                    with torch.no_grad():
+                        val_images, val_labels = next(val_iter)
+                        val_images = val_images.to(device)
+                        val_labels = val_labels.to(device)
+                        with autocast(device_type, enabled=self.use_amp):
+                            val_outputs = model(val_images)
+                        val_loss = self.criterion(val_outputs, val_labels)
+                        self.history.add_val_loss(epoch, self.sample_count, val_loss.item())
+                except StopIteration:
+                    pass
+                # switch back to training mode
+                model.train()
+
+            images = images.to(device)
+            labels = labels.to(device)
+            # compute output
+            # use AMP
+            with autocast(device_type, enabled=self.use_amp):
+                outputs = model(images)
+                loss = self.criterion(outputs, labels)
+
+            train_loss_list.append(loss.item())
+            self.sample_count += images.shape[0]
+            self.history.add_train_loss(epoch, self.sample_count, loss.item())
+            if (step + 1) % self.print_interval == 0:
+                print(f'Batch {step + 1}: training loss {loss.item():.5f}')
+            # compute gradient and do SGD step
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            optimizer.zero_grad()
+
+        mean_train_loss = np.array(train_loss_list).mean()
+        return mean_train_loss
+
+    def validate(self):
+        sigmoid = nn.Sigmoid()
+        losses = []
+        scores = []
+        self.model.eval()
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                with autocast(device_type, enabled=self.use_amp):
+                    outputs = self.model(images)
+                preds = sigmoid(outputs).round().to(torch.float32)
+                scores.append(util.dice_coeff(labels, preds).item())
+                losses.append(self.criterion(outputs, labels).item())
+        return np.mean(losses), np.mean(scores)
 
 
-class Trainer(DefaultTrainer):
-    @classmethod
-    def build_evaluator(cls, cfg, dataset_name, output_folder=None):
-        return MAPIOUEvaluator(dataset_name)
-
-    @classmethod
-    def build_train_loader(cls, cfg, sampler=None):
-        aug = build_train_augmentation(cfg)
-        mapper = DatasetMapper(cfg, is_train=True, augmentations=aug)
-        return build_detection_train_loader(cfg, mapper=mapper, sampler=sampler)
+def worker_init_fn(worker_id):
+    random.seed(random.randint(0, 2**32) + worker_id)
+    np.random.seed(random.randint(0, 2**32) + worker_id)
 
 
 def main():
     args = parser.parse_args()
-    train_set = 'train'
-
+    if args.subset != 100:
+        print(f'\nWARNING: {args.subset}% of the data will be used for training\n')
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
     input_dir = args.input
-    conf = Config()
-    print(conf)
-
-    img_dir = f'{input_dir}/train'
-    for set_name in ['train', 'val']:
-        json_file = f'{set_name}-dicts-coco.json'
-        if not os.path.exists(json_file):
-            print(f'{json_file} not found')
-            print('error: prep.sh must be run to preprocess the dataset')
-            sys.exit()
-        register_coco_instances(set_name, {}, json_file, img_dir)
-
-    meta_file = f'{input_dir}/train.csv'
-    meta_df = pd.read_csv(meta_file)
-    num_classes = len(get_class_names(meta_df))
-    train_len = len(DatasetCatalog.get(train_set))
-    cfg_name = conf.arch
-    cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file(cfg_name))
-    cfg.INPUT.MASK_FORMAT = 'bitmask'
-    cfg.INPUT.MIN_SIZE_TRAIN = (conf.min_size, conf.min_size + 16, conf.min_size + 32)
-    cfg.INPUT.MAX_SIZE_TRAIN = conf.max_size
-    cfg.INPUT.MIN_SIZE_TEST = conf.min_size
-    cfg.INPUT.MAX_SIZE_TEST = conf.max_size
-    cfg.INPUT.CROP = CN({"ENABLED": True})
-    cfg.INPUT.CROP.TYPE = "relative_range"
-    cfg.INPUT.CROP.SIZE = [conf.crop_size, conf.crop_size]
-    cfg.DATASETS.TRAIN = (train_set,)
-    cfg.DATASETS.TEST = ('val',)
-    cfg.DATALOADER.NUM_WORKERS = args.num_workers
-    cfg.SOLVER.IMS_PER_BATCH = conf.ims_per_batch
-    cfg.SOLVER.BASE_LR = conf.lr
-    cfg.SOLVER.MOMENTUM = conf.momentum
-    cfg.SOLVER.NESTEROV = conf.nesterov
-    batch_count = train_len//cfg.SOLVER.IMS_PER_BATCH
-    cfg.SOLVER.MAX_ITER = args.epochs*batch_count
-    cfg.SOLVER.GAMMA = conf.gamma
-    if conf.decay_steps == -1:
-        # disable decay
-        cfg.SOLVER.STEPS = []
+    model_file = args.resume
+    if model_file:
+        print(f'Loading model from {model_file}')
+        checkpoint = torch.load(model_file)
+        conf = Config(checkpoint['conf'])
     else:
-        cfg.SOLVER.STEPS = [conf.decay_steps]
-    cfg.OUTPUT_DIR = './'
-    if conf.pretrained:
-        cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(cfg_name)
-    cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = conf.bsz_per_img
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = conf.score_thresh_test
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = num_classes
-    cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_LOSS_TYPE = conf.loss_type
-    cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_LOSS_WEIGHT = conf.reg_loss_weight
-    cfg.MODEL.DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    cfg.MODEL.FPN.OUT_CHANNELS = conf.fpn_channels
-    cfg.MODEL.PROPOSAL_GENERATOR.NAME = conf.prop_gen
-    cfg.MODEL.RPN.NMS_THRESH = conf.nms_thresh
-    cfg.MODEL.RPN.BBOX_REG_LOSS_TYPE =  conf.loss_type
-    # validate after every epoch
-    cfg.TEST.EVAL_PERIOD = batch_count
-    cfg.TEST.DETECTIONS_PER_IMAGE = 100
-    # disable periodic checkpointing
-    cfg.SOLVER.CHECKPOINT_PERIOD = cfg.SOLVER.MAX_ITER + 1
-    cfg.SOLVER.AMP = CN({"ENABLED": True})
-    print(f'batch_count {batch_count}. {train_len} images in training set')
-    with open('cfg.yaml', 'w') as fd:
-        fd.write(cfg.dump())
+        checkpoint = None
+        conf = Config()
 
-    trainer = Trainer(cfg)
-    trainer.loss_history = LossHistory()
-    trainer.register_hooks([ValidationLossHook(cfg, conf, batch_count)])
-    # The PeriodicWriter needs to be the last hook, otherwise it wont
-    # have access to val_loss metrics
-    # ref: https://github.com/facebookresearch/detectron2/issues/810
-    periodic_writer_hook = [hook for hook in trainer._hooks if isinstance(hook, PeriodicWriter)]
-    all_other_hooks = [hook for hook in trainer._hooks if not isinstance(hook, PeriodicWriter)]
-    trainer._hooks = all_other_hooks + periodic_writer_hook
-
-    trainer.resume_or_load(resume=args.resume)
-    trainer.train()
-    trainer.loss_history.save()
+    print(conf)
+    trainer = Trainer(
+        conf, input_dir, device, args.num_workers,
+        checkpoint, args.print_interval, args.subset)
+    trainer.fit(args.epochs)
 
 
 if __name__ == '__main__':
     main()
+    print('Done')

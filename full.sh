@@ -8,4 +8,6 @@
 #  - This script will be run from your output directory
 #  - Imported Data is accessible via the relative path ../input/
 
+pip3 install -q -r ../code/requirements.txt
+
 /usr/bin/time -f "Time taken: %E" python3 ../code/train.py --epochs 60

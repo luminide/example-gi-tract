@@ -4,12 +4,10 @@
 # It creates a dataset on Kaggle with all the files required to
 # make a submission.
 
-dataset_name=kagglecode
+dataset_name=kagglecode1
 mkdir -p ../$dataset_name
 
-echo
-echo $(tput -T xterm setaf 4)Press enter to upload the code to a private dataset on Kaggle$(tput -T xterm sgr0)
-read
+echo $(tput -T xterm setaf 4)Uploading the code to a private dataset on Kaggle... $(tput -T xterm sgr0)
 
 # check for Kaggle API credentials
 [[ ! -f ~/.kaggle/kaggle.json ]]  && { echo 'error: Kaggle API token needs to be configured using the "Import Data" tab'; exit 1; }
@@ -41,11 +39,13 @@ status=$(kaggle datasets status $dataset_name)
 [[ $status != "ready" ]]  && { echo "creating kaggle dataset..."; kaggle datasets create; }
 
 # copy source code
-cp -v ../code/inference.py .
+for file in config.py dataset.py inference.py models.py util.py
+do
+    cp -v ../code/$file .
+done
 
 # copy trained model
 cp -v ../output/model.pth .
-cp -v ../output/cfg.yaml .
 
 # upload to kaggle
 kaggle datasets version -m "$(date)"
