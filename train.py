@@ -1,11 +1,13 @@
 import os
 import argparse
 import random
+import re
 import multiprocessing as mp
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import segmentation_models_pytorch as smp
+from glob import glob
 
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
@@ -77,6 +79,12 @@ class Trainer:
             smp.losses.TverskyLoss(mode='multilabel', log_loss=False),
         ]
         self.history = None
+        self.model_id = 0
+        model_files = glob('model*.pth')
+        # find a number that has not been taken
+        nums = list(map(int, re.findall('\d+', ' '.join(model_files))))
+        if len(nums) > 0:
+            self.model_id = np.max(nums) + 1
 
     def create_dataloaders(self, num_workers, subset):
         conf = self.conf
@@ -122,6 +130,9 @@ class Trainer:
                 weight_decay=conf.weight_decay)
         return None
 
+    def save_model(self, state):
+        torch.save(state, f'model{self.model_id}.pth')
+
     def fit(self, epochs):
         best_loss = None
         patience = self.max_patience
@@ -136,6 +147,7 @@ class Trainer:
         log_dir = f"runs/{datetime.now().strftime('%b%d_%H-%M-%S')}{suffix}"
         writer = SummaryWriter(log_dir=log_dir)
 
+        print(f'The best model will be saved as model{self.model_id}.pth')
         print('Training in progress...')
         for epoch in range(epochs):
             # train for one epoch
@@ -157,7 +169,7 @@ class Trainer:
                     'optimizer' : self.optimizer.state_dict(),
                     'conf': self.conf.as_dict()
                 }
-                torch.save(state, 'model.pth')
+                self.save_model(state)
                 patience = self.max_patience
             else:
                 patience -= 1

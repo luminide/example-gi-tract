@@ -12,6 +12,8 @@ class VisionDataset(data.Dataset):
         self.transform = transform
         self.is_test = is_test
 
+        if 'num_slices' not in self.conf._params:
+            self.conf['num_slices'] = 5
         if subset != 100:
             assert subset < 100
             # train and validate on subsets
@@ -33,29 +35,27 @@ class VisionDataset(data.Dataset):
                 'slice_' + slice_num,
                 'slice_' + str(int(slice_num) + diff).zfill(4)))
         if os.path.exists(filename):
-            return cv2.imread(filename, cv2.IMREAD_UNCHANGED)
+            img = cv2.imread(filename, cv2.IMREAD_UNCHANGED)
+            return self.resize(img, cv2.INTER_AREA)
         return None
 
     def __getitem__(self, index):
         conf = self.conf
+        num_slices = conf.num_slices
+        assert num_slices % 2 == 1
         img_file = self.files[index]
-        # read 5 slices into one image
-        imgs = [self.load_slice(img_file, i) for i in range(-2, 3)]
-        if imgs[3] is None:
-            imgs[3] = imgs[2]
-        if imgs[4] is None:
-            imgs[4] = imgs[3]
-        if imgs[1] is None:
-            imgs[1] = imgs[2]
-        if imgs[0] is None:
-            imgs[0] = imgs[1]
-        img = np.stack(imgs, axis=2)
+        # read multiple slices into one image
+        img = np.zeros(
+            (conf.image_size, conf.image_size, num_slices), dtype=np.float32)
+        for i, diff in enumerate(range(-(num_slices//2), num_slices//2 + 1)):
+            slc =  self.load_slice(img_file, diff)
+            if slc is None:
+                continue
+            img[:, :, i] = slc
 
-        img = img.astype(np.float32)
         max_val = img.max()
         if max_val != 0:
             img /= max_val
-        img = self.resize(img, cv2.INTER_AREA)
 
         if self.is_test:
             msk = 0

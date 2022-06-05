@@ -45,7 +45,7 @@ do
 done
 
 # copy trained model
-cp -v ../output/model.pth .
+cp -v ../output/model*.pth .
 
 # upload to kaggle
 kaggle datasets version -m "$(date)"

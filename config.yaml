@@ -1,8 +1,9 @@
-# FPN, Unet or DeepLab
+# FPN, Unet, Unet++ or DeepLabV3
 arch: FPN
 backbone: efficientnet-b3
 pretrained: true
 
+num_slices: 5
 # resize images to this size on the fly
 image_size: 320
 # crop to this fraction of image_size
@@ -15,7 +16,7 @@ weight_decay: 0.01
 batch_size: 32
 
 # scheduler settings
-gamma: 0.96
+gamma: 0.98
 
 # data augmentation
 aug_prob: 0.4
