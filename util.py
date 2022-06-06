@@ -86,14 +86,7 @@ def process_files(input_dir, img_dir, meta_df, class_names):
         df = df[~df['img_files'].str.contains('case7_day0') & ~df['img_files'].str.contains('case81_day30')].reset_index(drop=True)
         return df
 
-    img_files = []
-    subdir = ''
-    while len(img_files) == 0:
-        img_files = sorted(glob(f'{input_dir}/{img_dir}/{subdir}*.png'))
-        subdir += '*/'
-        if len(subdir) > 10:
-            return None
-
+    img_files = sorted(glob(f'{input_dir}/{img_dir}/**/*.png', recursive=True))
     mask_dir = '../masks'
     for img_file in img_files:
         mask = get_mask(img_file, meta_df, class_names)
