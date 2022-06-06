@@ -19,14 +19,9 @@ print(f'Running on {device}')
 def create_test_loader(conf, input_dir, class_names):
     test_aug = make_test_augmenter(conf)
     test_df = pd.DataFrame()
-    img_files = []
     img_dir = 'test'
-    subdir = ''
-    while len(img_files) == 0 and len(subdir) < 10:
-        img_files = sorted(glob(f'{input_dir}/{img_dir}/{subdir}*.png'))
-        subdir += '*/'
-        if len(subdir) > 10:
-            return None
+    img_files = sorted(glob(f'{input_dir}/{img_dir}/**/*.png', recursive=True))
+
     # delete common prefix from paths
     img_files = [f.replace(f'{input_dir}/{img_dir}/', '') for f in img_files]
 
