@@ -252,10 +252,11 @@ class Trainer:
                 labels = labels.to(device)
                 with autocast(device_type, enabled=self.use_amp):
                     outputs = self.model(images)
+                    loss = self.criterion(outputs,labels)
                 preds = sigmoid(outputs).round().to(torch.float32)
                 scores.append(util.dice_coeff(labels, preds).item())
-                losses.append(self.criterion(outputs, labels).item())
-        return np.mean(losses), np.mean(scores)
+                losses.append(loss.item())
+        return np.array(losses).mean(), np.mean(scores)
 
 
 def worker_init_fn(worker_id):
