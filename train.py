@@ -157,10 +157,10 @@ class Trainer:
             self.scheduler.step()
             writer.add_scalar('Training loss', train_loss, epoch)
             writer.add_scalar('Validation loss', val_loss, epoch)
-            writer.add_scalar('Validation F1 score', val_score, epoch)
+            writer.add_scalar('Validation Dice score', val_score, epoch)
             writer.flush()
             print(f'training loss {train_loss:.5f}')
-            print(f'Validation F1 score {val_score:.4f} loss {val_loss:.4f}\n')
+            print(f'Validation Dice score {val_score:.4f} loss {val_loss:.4f}\n')
             self.history.add_epoch_val_loss(epoch, self.sample_count, val_loss)
             if best_loss is None or val_loss < best_loss:
                 best_loss = val_loss
